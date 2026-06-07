@@ -5,7 +5,7 @@
 # Скрипт: pve_ssh_backup_vm.py
 # Назначение: Резервное копирование последних архивных копий VM Proxmox
 # Автор: Jules (AI Assistant)
-# Версия: v 0.01.00
+# Версия: v 0.02.00
 # ======================================================================
 
 
@@ -28,7 +28,7 @@ except ImportError:
     print("Ошибка: Библиотека 'paramiko' не найдена. Установите её командой: pip install paramiko")
     sys.exit(1)
 
-VERSION = "v 0.01.00"
+VERSION = "v 0.02.00"
 CONFIG_FILE_NAME = "pve_ssh_backup_vm_config.py"
 
 class Color:
@@ -40,6 +40,11 @@ class Color:
     WHITE  = '\033[37m'
     RESET  = '\033[0m'
     CLEAR_LINE = '\033[K'
+
+    # НОВЫЕ цвета
+    ORANGE       = '\033[38;5;208m'  # Оранжевый для предупреждений
+    BRIGHT_GREEN = '\033[92m'         # Ярко-зеленый для успеха
+    BOLD         = '\033[1m'          # Жирный шрифт для выделения
 
 
 # ======================================================================
@@ -83,17 +88,22 @@ SERVERS = [
         "username": "root",
         "key_path": "C:/path/to/private_key", # Путь к приватному ключу SSH
         "local_base_path": "D:/BackUp/Proxmox", # Локальная папка для этого сервера
-        # Словарь VM: "ID": количество_копий
-        # Если количество 0 - удалить все локальные копии этой VM
+        # Словарь VM: "ID": значение
+        # Положительные числа (1, 2, 3...) - оставить указанное количество копий
+        # Значение 0 - пропустить VM (не копировать, не ротировать)
+        # Значение -1 - удалить все локальные копии этой VM
         "vm_config": {{
             "101": 3,
             "102": 5,
+            "103": 0,
+            "104": -1,
         }}
     }},
 ]
 
 # Глобальные настройки
 TIMEOUT = 30  # Таймаут сетевых операций в секундах
+MIN_FREE_COPIES_WARNING = 5  # Минимальное количество копий для зеленой зоны (проверка места)
 '''
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -416,6 +426,9 @@ def rotate_local_backups(server_name, vm_config, local_base_path):
         return
 
     for vm_id, max_copies in vm_config.items():
+        if max_copies == 0:
+            continue # Пропускаем VM со значением 0
+
         vm_path = server_path / vm_id
         if not vm_path.exists():
             continue
@@ -423,12 +436,12 @@ def rotate_local_backups(server_name, vm_config, local_base_path):
         # Получаем список всех папок бэкапов для этой VM, сортируем по имени (в имени дата)
         backups = sorted([d for d in vm_path.iterdir() if d.is_dir()])
 
-        if max_copies == 0:
-            print(f"{Color.YELLOW}Удаление всех копий для VM {vm_id} (лимит 0)...{Color.RESET}")
+        if max_copies == -1:
+            print(f"{Color.YELLOW}Удаление всех локальных копий для VM {vm_id} (лимит -1)...{Color.RESET}")
             shutil.rmtree(vm_path, ignore_errors=True)
             continue
 
-        while len(backups) > max_copies:
+        while max_copies > 0 and len(backups) > max_copies:
             oldest = backups.pop(0)
             print(f"{Color.YELLOW}Ротация: удаление старой копии VM {vm_id}: {oldest.name}{Color.RESET}")
             shutil.rmtree(oldest, ignore_errors=True)
@@ -449,6 +462,7 @@ def main():
 
     config = load_config()
     timeout = getattr(config, "TIMEOUT", 30)
+    min_free_copies_warning = getattr(config, "MIN_FREE_COPIES_WARNING", 5)
     total_downloaded = 0
 
     try:
@@ -470,16 +484,69 @@ def main():
                     print(f"{Color.YELLOW}На сервере не найдено хранилищ с контентом 'backup'.{Color.RESET}")
                     continue
 
-                vm_ids = list(server["vm_config"].keys())
-                print(f"Поиск бэкапов для VM: {', '.join(vm_ids)}...")
-                latest_backups = get_latest_backups(ssh, dump_paths, vm_ids)
+                # Фильтрация VM ID: исключаем те, у которых значение 0
+                all_vm_config = server.get("vm_config", {})
+                active_vm_ids = [vm_id for vm_id, val in all_vm_config.items() if val != 0]
+                skipped_vm_ids = [vm_id for vm_id, val in all_vm_config.items() if val == 0]
 
-                if not latest_backups:
-                    print(f"{Color.YELLOW}Бэкапы для указанных VM не найдены.{Color.RESET}")
+                # Отдельно выделяем VM для копирования (>0) и только для очистки (-1)
+                copy_vm_ids = [vm_id for vm_id, val in all_vm_config.items() if val > 0]
+
+                print(f"\n{Color.CYAN}Информация о VM:{Color.RESET}")
+                print(f"  Всего VM в конфигурации: {Color.WHITE}{len(active_vm_ids)}{Color.RESET}")
+
+                latest_backups = get_latest_backups(ssh, dump_paths, active_vm_ids)
+
+                # Фильтруем бэкапы, оставляя только те, что предназначены для копирования (>0)
+                backups_to_download = {vm_id: info for vm_id, info in latest_backups.items() if vm_id in copy_vm_ids}
+
+                print(f"  Найдено на сервере: {Color.WHITE}{len(latest_backups)}{Color.RESET}")
+
+                if skipped_vm_ids:
+                    print(f"  {Color.YELLOW}VM будут пропущены: {', '.join(skipped_vm_ids)}{Color.RESET}")
+
+                # Расчет суммарного объема
+                total_volume_bytes = 0
+                for info in backups_to_download.values():
+                    total_volume_bytes += sum(attr.st_size for attr in info['files'].values())
+
+                total_volume_gb = total_volume_bytes / (1024 ** 3)
+                print(f"\nПланируется скопировать: {Color.WHITE}{Color.BOLD}{total_volume_gb:.2f}{Color.RESET} GB")
+
+                if total_volume_gb == 0:
+                    print(f"{Color.YELLOW}Нет VM для копирования (все VM пропущены или не найдены){Color.RESET}")
                 else:
-                    print(f"Найдено бэкапов для {len(latest_backups)} VM.")
-                    downloaded = download_backups(ssh, server_name, latest_backups, server["local_base_path"])
-                    total_downloaded += downloaded
+                    # Проверка свободного места
+                    local_path = Path(server["local_base_path"])
+                    local_path.mkdir(parents=True, exist_ok=True)
+
+                    if sys.platform == "win32":
+                        free_bytes = ctypes.c_ulonglong(0)
+                        ctypes.windll.kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(str(local_path)), None, None, ctypes.byref(free_bytes))
+                        free_space_gb = free_bytes.value / (1024 ** 3)
+                    else:
+                        st = os.statvfs(local_path)
+                        free_space_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+
+                    possible_copies = int(free_space_gb // total_volume_gb) if total_volume_gb > 0 else 999
+
+                    if possible_copies >= min_free_copies_warning:
+                        print(f"{Color.BRIGHT_GREEN}✓ Достаточно места: {Color.WHITE}{free_space_gb:.2f}{Color.BRIGHT_GREEN} GB свободно, хватит на {Color.WHITE}{possible_copies}{Color.BRIGHT_GREEN} полных копий{Color.RESET}\n")
+                    elif possible_copies >= 1:
+                        print(f"{Color.ORANGE}⚠ ВНИМАНИЕ: Мало места! {Color.WHITE}{free_space_gb:.2f}{Color.ORANGE} GB свободно, хватит всего на {Color.WHITE}{possible_copies}{Color.ORANGE} полных копий{Color.RESET}\n")
+                    else:
+                        print(f"{Color.RED}{Color.BOLD}✗ КРИТИЧЕСКАЯ ОШИБКА: Недостаточно места!{Color.RESET}")
+                        print(f"{Color.RED}Требуется: {Color.WHITE}{total_volume_gb:.2f}{Color.RED} GB, доступно: {Color.WHITE}{free_space_gb:.2f}{Color.RED} GB{Color.RESET}")
+                        print(f"{Color.ORANGE}!!! Выход из приложения !!!{Color.RESET}")
+                        sys.exit(1)
+
+                    print(f"Поиск бэкапов для VM: {', '.join(copy_vm_ids)}...")
+                    if not backups_to_download:
+                        print(f"{Color.YELLOW}Бэкапы для указанных VM не найдены.{Color.RESET}")
+                    else:
+                        print(f"Найдено бэкапов для {len(backups_to_download)} VM.")
+                        downloaded = download_backups(ssh, server_name, backups_to_download, server["local_base_path"])
+                        total_downloaded += downloaded
 
                 print(f"Выполнение ротации локальных копий...")
                 rotate_local_backups(server_name, server["vm_config"], server["local_base_path"])
@@ -505,7 +572,11 @@ def main():
         # Расчет средней скорости
         if duration.total_seconds() > 0:
             avg_speed_mbps = (total_downloaded / (1024 * 1024)) / duration.total_seconds()
-            print(f" Средняя скорость: {Color.WHITE}{avg_speed_mbps:.1f} MB/s{Color.RESET}")
+            print(f" Средняя скорость: {Color.WHITE}{avg_speed_mbps:.1f} MB/s{Color.CYAN}")
+
+        # Всего скопировано данных
+        downloaded_gb = total_downloaded / (1024 ** 3)
+        print(f" Всего скопировано данных: {Color.GREEN}{downloaded_gb:.2f}{Color.CYAN} GB{Color.RESET}")
 
         print(f"{Color.CYAN}{'='*70}{Color.RESET}")
 
